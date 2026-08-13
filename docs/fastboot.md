@@ -101,7 +101,7 @@ scanned for it.
 - **`writeBootPartition` needs a payload already in boot-partition format, which a `bootloader.dump` is not.**
   On the amlogic path there is no such step: `restorePartition bootloader` becomes `amlmmc write bootloader`, and
   amlogic's "bootloader partition" *is* eMMC boot0. What vendor u-boot lays down there is **a 512-byte header
-  followed by the bootloader image**, so the amlogic BL2 magic starts at offset `0x200`, not `0`. Copying a
+  followed by the bootloader image**, so BL2 itself starts at offset `0x200`, not `0`. Copying a
   `bootloader.dump` into boot0 raw puts everything one sector early and the boot ROM finds nothing. Only boot0 is
   written — boot1 is left entirely zeroed.
 

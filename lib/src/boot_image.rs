@@ -17,11 +17,18 @@ pub const INFO_SECTOR_BYTES: usize = 512;
 /// How much of a bootloader image lands on disk, matching the eMMC boot hwpart size on a Car Thing.
 pub const BOOT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Leading bytes shared by every signed amlogic bootloader image we handle — the encrypted BL2 header.
+/// First bytes of the *stock* Car Thing BL2.
 ///
-/// `superbird.bl2.encrypted.bin`, `superbird.bootloader.img` and a stock `bootloader.dump` all begin with these,
-/// which is what makes it a usable "is this a bare image?" test.
-const BL2_SIGNATURE: [u8; 8] = [0x0c, 0x62, 0x7a, 0x15, 0xbe, 0x94, 0x07, 0xb2];
+/// Kept as a cross-check and a landmark when reading hex dumps. It is tempting to use as an "is this a bare image?"
+/// test, since `superbird.bl2.encrypted.bin`, `superbird.bootloader.img` and a stock `bootloader.dump` all begin
+/// with it — but all three derive from the same stock BL2, and BL2 is encrypted, so this is one build's first
+/// ciphertext block rather than a magic. An 8.9.2 thinglabs `bootloader.dump` does not contain the sequence
+/// anywhere. Testing for it classifies every differently-signed bootloader as already prepared, which writes it a
+/// sector early — the one mistake on this path that reads back perfect and never boots.
+pub const STOCK_BL2_PREFIX: [u8; 8] = [0x0c, 0x62, 0x7a, 0x15, 0xbe, 0x94, 0x07, 0xb2];
+
+/// Offset past the info sector's defined fields; everything from here to the checksum is reserved.
+const INFO_SECTOR_RESERVED_FROM: usize = 0x18;
 
 /// Build the info sector for a Car Thing.
 ///
@@ -47,9 +54,37 @@ pub fn info_sector() -> [u8; INFO_SECTOR_BYTES] {
   sector
 }
 
-/// Whether `data` is a bare bootloader image that still needs an info sector in front of it.
+/// Whether `data` already opens with an info sector.
+///
+/// Detecting the sector is far more reliable than detecting the bootloader behind it. BL2 is encrypted, so its
+/// leading bytes differ per build and per signing key and cannot be recognised at all; an info sector is a fixed
+/// shape — a handful of small header fields, ~480 bytes of zero padding, and a checksum of everything ahead of it
+/// in the last word. High-entropy ciphertext does not accidentally take that shape.
+///
+/// An all-zero sector passes too, which is intended: that is what `unbrick.bin` and other whole-disk images carry
+/// at LBA 0, and it boots.
+fn has_info_sector(data: &[u8]) -> bool {
+  if data.len() < INFO_SECTOR_BYTES {
+    return false;
+  }
+  if data[INFO_SECTOR_RESERVED_FROM..INFO_SECTOR_BYTES - 4].iter().any(|&byte| byte != 0) {
+    return false;
+  }
+
+  let checksum = data[..INFO_SECTOR_BYTES - 4]
+    .chunks_exact(4)
+    .fold(0u32, |acc, word| acc.wrapping_add(u32::from_le_bytes(word.try_into().unwrap())));
+  checksum == u32::from_le_bytes(data[INFO_SECTOR_BYTES - 4..INFO_SECTOR_BYTES].try_into().unwrap())
+}
+
+/// Whether `data` is a bare bootloader image that still needs an info sector in front of it — i.e. anything not
+/// already carrying one.
+///
+/// Defaulting to "bare" is deliberate. Getting it wrong in this direction writes a spurious 512 bytes ahead of an
+/// image that did not need them, which is visible immediately; getting it wrong the other way puts a whole
+/// bootloader one sector early, where every byte reads back correct and the device simply never boots.
 pub fn needs_info_sector(data: &[u8]) -> bool {
-  data.starts_with(&BL2_SIGNATURE)
+  !has_info_sector(data)
 }
 
 /// Put a bootloader image into the form the SoC expects to find on eMMC.
@@ -87,10 +122,25 @@ mod tests {
     assert!(sector[0x018..0x1fc].iter().all(|&b| b == 0));
   }
 
+  /// A bare image is anything that does not open with an info sector, whatever its leading bytes happen to be.
   #[test]
   fn bare_images_get_an_info_sector() {
-    let mut bare = BL2_SIGNATURE.to_vec();
-    bare.extend_from_slice(&[0xab; 64]);
+    let mut bare = STOCK_BL2_PREFIX.to_vec();
+    bare.extend_from_slice(&[0xab; 1024]);
+
+    let image = to_boot_image(&bare);
+    assert_eq!(&image[..INFO_SECTOR_BYTES], &info_sector());
+    assert_eq!(&image[INFO_SECTOR_BYTES..], &bare[..]);
+  }
+
+  /// The regression that cost a flash: a bootloader signed with a different key shares none of the stock BL2's
+  /// leading bytes, and was therefore taken for an already-prepared image and written a sector early.
+  #[test]
+  fn differently_signed_bootloaders_are_still_bare() {
+    // Stand-in for an 8.9.2 thinglabs dump: ciphertext from byte 0, no recognisable header anywhere.
+    let bare: Vec<u8> = (0..4096u32).map(|i| i.wrapping_mul(2654435761).to_le_bytes()[0]).collect();
+    assert!(!bare.starts_with(&STOCK_BL2_PREFIX));
+    assert!(needs_info_sector(&bare));
 
     let image = to_boot_image(&bare);
     assert_eq!(&image[..INFO_SECTOR_BYTES], &info_sector());
@@ -100,16 +150,44 @@ mod tests {
   #[test]
   fn prepared_images_are_left_alone() {
     let mut prepared = info_sector().to_vec();
-    prepared.extend_from_slice(&BL2_SIGNATURE);
+    prepared.extend_from_slice(&STOCK_BL2_PREFIX);
 
     assert_eq!(to_boot_image(&prepared), prepared);
   }
 
+  /// What `unbrick.bin` and other whole-disk images carry at LBA 0. Shifting one of those by a sector would
+  /// destroy the whole image, so the all-zero sector has to read as prepared.
+  #[test]
+  fn an_all_zero_info_sector_counts_as_prepared() {
+    let mut prepared = vec![0u8; INFO_SECTOR_BYTES];
+    prepared.extend_from_slice(&STOCK_BL2_PREFIX);
+
+    assert!(!needs_info_sector(&prepared));
+    assert_eq!(to_boot_image(&prepared), prepared);
+  }
+
+  /// A payload too short to contain a sector cannot be carrying one.
+  #[test]
+  fn short_payloads_are_bare() {
+    assert!(needs_info_sector(&[0u8; INFO_SECTOR_BYTES - 1]));
+  }
+
+  /// A sector-shaped block whose checksum does not add up is not an info sector.
+  #[test]
+  fn a_bad_checksum_is_not_an_info_sector() {
+    let mut sector = info_sector();
+    sector[0x1fc] ^= 0xff;
+
+    assert!(needs_info_sector(&sector));
+  }
+
   #[test]
   fn oversized_images_are_capped() {
-    let mut bare = BL2_SIGNATURE.to_vec();
+    let mut bare = STOCK_BL2_PREFIX.to_vec();
     bare.resize(BOOT_IMAGE_BYTES, 0);
 
+    // Zero padding after a non-zero header still fails the checksum, so this stays bare.
+    assert!(needs_info_sector(&bare));
     assert_eq!(to_boot_image(&bare).len(), BOOT_IMAGE_BYTES);
   }
 }

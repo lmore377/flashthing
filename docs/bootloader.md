@@ -90,9 +90,21 @@ form:
 { "type": "writeBootPartition", "value": { "hwpart": 1, "data": { "filePath": "stock-boot-partition.bin" } } }
 ```
 
-Both run the payload through `to_boot_image()`, which decides what to do by looking at the first bytes: a bare
-image starts with the encrypted BL2 header, an already-prepared one starts with an info sector. So a recipe can
-carry whichever file it happens to have.
+Both run the payload through `to_boot_image()`, which decides what to do by asking whether an info sector is
+already there — so a recipe can carry whichever file it happens to have.
+
+**It tests for the sector, not for the bootloader, and that distinction cost a flash.** The obvious test is the
+other way round: every bootloader we ship starts with `0c 62 7a 15 be 94 07 b2`, so treat that as "bare". But BL2
+is *encrypted*, and all three of those files descend from the same stock BL2 — that sequence is one build's first
+ciphertext block, not a magic. An 8.9.2 thinglabs `bootloader.dump` does not contain it anywhere in 4 MiB, so it
+read as already-prepared, went down raw, and put BL2 at LBA 0. Every byte read back correct and the device sat at
+a black screen.
+
+An info sector, by contrast, is a fixed shape: a few small header fields, ~480 bytes of zero padding, and a
+checksum of everything ahead of it in the last word. Ciphertext does not take that shape by accident. An all-zero
+sector passes deliberately — that is what `unbrick.bin` carries at LBA 0, and it boots. Anything else is treated
+as bare, which is the safe default: a spurious 512 bytes is visible immediately, a bootloader one sector early is
+not.
 
 The result is capped at 4 MiB, the eMMC boot hwpart size on a Car Thing. That only discards trailing padding —
 real content is around 1.3 MiB. **Caveat:** `BOOT_SIZE_MULT` is factory-set per eMMC chip and 2 MiB variants
