@@ -594,9 +594,13 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
 
       FlashStep::RestorePartition { value } if value.name == "bootloader" => {
         // `bootloader` is not a partition write at all. Vendor u-boot turns `amlmmc write bootloader` into an info
-        // sector plus the image, laid down in *two* places: the user-area mirror at LBA 0, which is what the SoC
-        // boots from on a Car Thing, and boot0, which backs it up. Doing only the raw user-area write here would
-        // put every byte one sector early and leave the boot hwpart empty.
+        // sector plus the image, laid down in the user-area mirror at LBA 0 and in the boot hwparts. Doing only the
+        // raw user-area write here would put every byte one sector early and leave the hwparts empty.
+        //
+        // The user-area mirror is what a Car Thing has been observed to boot from in practice, whatever EXT_CSD
+        // says. Both hwparts are still mirrored, because a device that still carries the stock
+        // `PARTITION_CONFIG = 0x50` points the mask ROM at *boot1*, and leaving that one empty would rest the whole
+        // restore on the mirror being reached first.
         let data = read_payload(&value.data, &mut self.store).await?;
         let image = crate::boot_image::to_boot_image(&data);
 
@@ -606,6 +610,7 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
           .write_raw(0, inline_source(&image).as_mut(), image.len(), false, progress)
           .await?;
         self.write_boot_hwpart(1, &image).await?;
+        self.write_boot_hwpart(2, &image).await?;
       }
 
       FlashStep::RestorePartition { value } => {

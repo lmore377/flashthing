@@ -43,21 +43,23 @@ while passing an already-prepared one through untouched.
 The same info-sector-plus-image layout exists in two places:
 
 - **User-area LBA 0** — the mirror. On a Car Thing this is what actually boots.
-- **boot0** (eMMC hwpart 1) — the backup.
+- **boot0 / boot1** (eMMC hwparts 1 and 2) — the backup, mirrored.
 
 Evidence for that ordering, measured on a device restored from a fully zeroed eMMC: it boots with **boot1 blank**
 and EXT_CSD `PARTITION_CONFIG = 0x00`, so nothing is pointing the ROM at a boot hwpart at all. Amlogic's own
 documentation frames the hwparts as primary and the user-area mirror as "BL2 fallback path 2"; on this hardware
-the observed behaviour is the other way round.
+the observed behaviour is the other way round, and a stock Car Thing appears to boot from the user area whatever
+EXT_CSD says.
 
-Vendor u-boot writes both copies when it handles `amlmmc write bootloader`, and leaves boot1 alone. A restore
-should do the same.
+A restore should still write **both** hwparts. Stock ships `PARTITION_CONFIG = 0x50`, which points the mask ROM at
+boot1, so a device that still carries that value and an empty boot1 has nothing to fall back on if the mirror is
+ever missed. Mirroring both costs one extra 4 MiB write and matches what vendor tooling produces.
 
-It writes the user-area copy **from LBA 1**, though — `GXL_START_BLK = 1` on G12A and later — so it never touches
-user-area LBA 0 at all. Measured on a restored device, that sector was still byte-identical to whatever had been
-written there previously (in our case `unbrick.bin`'s first sector), and it booted regardless. Consistent with BL2
-never reading the sector. Flashthing writes a well-formed one instead, which also boots; nothing depends on the
-contents either way.
+Vendor u-boot, for its part, writes the user-area copy **from LBA 1** — `GXL_START_BLK = 1` on G12A and later — so
+it never touches user-area LBA 0 at all. Measured on a restored device, that sector was still byte-identical to
+whatever had been written there previously (in our case `unbrick.bin`'s first sector), and it booted regardless.
+Consistent with BL2 never reading the sector. Flashthing writes a well-formed one instead, which also boots;
+nothing depends on the contents either way.
 
 ## EXT_CSD `PARTITION_CONFIG`
 
@@ -75,7 +77,7 @@ In order:
 1. The stock partition payloads at their stock LBAs.
 2. The amlogic MPT at **LBA 73728** (`MPT\0`, 18 entries on stock). `unbrick.bin` spans LBA 0–125000 and carries
    it, so a separate `mpt.bin` is redundant if you write that first.
-3. The bootloader **last**, as an info sector plus the image, to user-area LBA 0 *and* boot0.
+3. The bootloader **last**, as an info sector plus the image, to user-area LBA 0 *and* both boot hwparts.
 
 Writing the bootloader last matters: a failure partway through then leaves a device that falls into the mask ROM
 rather than one that half-boots.
@@ -83,7 +85,7 @@ rather than one that half-boots.
 ## Doing it in flashthing
 
 `restorePartition` with the name `bootloader` handles all of this. It is deliberately not a plain partition
-write — it builds the on-disk image and lays down both copies:
+write — it builds the on-disk image and lays it down in the user area and both boot hwparts:
 
 ```json
 { "type": "restorePartition", "value": { "name": "bootloader", "data": { "filePath": "bootloader.dump" } } }

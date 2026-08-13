@@ -70,7 +70,7 @@ their own bytes to `Fastboot::connect_with` rather than use the bundled one.
 | `writeLargeMemory`                                       | the same, at the step's disk address ÷ 512                      |
 | `writeBootPartition`                                     | `flash:mmc0boot0` / `flash:mmc0boot1`, then a hwpart reset      |
 | `restorePartition`                                       | the stock partition's LBA range, or a GPT name if it isn't one  |
-| `restorePartition` named `bootloader`                    | info sector + image, written to user-area LBA 0 *and* boot0      |
+| `restorePartition` named `bootloader`                    | info sector + image, to user-area LBA 0 *and* both boot hwparts   |
 | `writeEnv`                                               | download + `env import -t` + `saveenv`                          |
 | `bulkcmd`, `bulkcmdStat`                                 | rewritten vendor command through `oem console`                  |
 | `identify`                                               | `getvar:product` and `getvar:version-bootloader`                |
@@ -103,8 +103,7 @@ scanned for it.
   On the amlogic path there is no such step: `restorePartition bootloader` becomes `amlmmc write bootloader`, and
   amlogic's "bootloader partition" *is* eMMC boot0. What vendor u-boot lays down there is **a 512-byte header
   followed by the bootloader image**, so BL2 itself starts at offset `0x200`, not `0`. Copying a
-  `bootloader.dump` into boot0 raw puts everything one sector early and the boot ROM finds nothing. Only boot0 is
-  written — boot1 is left entirely zeroed.
+  `bootloader.dump` into boot0 raw puts everything one sector early and the boot ROM finds nothing.
 
   That sector is amlogic's `storage_emmc_boot_info`, and the same layout is mirrored at **user-area LBA 0** —
   which is the copy a Car Thing actually boots from. Both `restorePartition bootloader` and `writeBootPartition`
