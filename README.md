@@ -11,6 +11,8 @@ FlashThing currently supports flashing the Stock partition tables as well as cus
 
 FlashThing can flash over two protocols: amlogic's vendor burn mode (the default, and what a stock device offers) or standard Android fastboot against mainline u-boot. Both take the same `meta.json` — see the [fastboot docs](./docs/fastboot.md).
 
+Restoring a bootloader is not a plain partition write; the [bootloader docs](./docs/bootloader.md) cover the on-disk layout, which copies matter, and what a stock restore has to write.
+
 ## Installation
 
 ### Rust Crate

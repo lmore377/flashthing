@@ -69,6 +69,7 @@ their own bytes to `Fastboot::connect_with` rather than use the bundled one.
 | `writeLargeMemory`                                       | the same, at the step's disk address ÷ 512                      |
 | `writeBootPartition`                                     | `flash:mmc0boot0` / `flash:mmc0boot1`, then a hwpart reset      |
 | `restorePartition`                                       | the stock partition's LBA range, or a GPT name if it isn't one  |
+| `restorePartition` named `bootloader`                    | info sector + image, written to user-area LBA 0 *and* boot0      |
 | `writeEnv`                                               | download + `env import -t` + `saveenv`                          |
 | `bulkcmd`, `bulkcmdStat`                                 | rewritten vendor command through `oem console`                  |
 | `identify`                                               | `getvar:product` and `getvar:version-bootloader`                |
@@ -97,6 +98,17 @@ scanned for it.
 
 ## Things worth knowing
 
+- **`writeBootPartition` needs a payload already in boot-partition format, which a `bootloader.dump` is not.**
+  On the amlogic path there is no such step: `restorePartition bootloader` becomes `amlmmc write bootloader`, and
+  amlogic's "bootloader partition" *is* eMMC boot0. What vendor u-boot lays down there is **a 512-byte header
+  followed by the bootloader image**, so the amlogic BL2 magic starts at offset `0x200`, not `0`. Copying a
+  `bootloader.dump` into boot0 raw puts everything one sector early and the boot ROM finds nothing. Only boot0 is
+  written — boot1 is left entirely zeroed.
+
+  That sector is amlogic's `storage_emmc_boot_info`, and the same layout is mirrored at **user-area LBA 0** —
+  which is the copy a Car Thing actually boots from. Both `restorePartition bootloader` and `writeBootPartition`
+  build it for you, from either a bare dump or an already-prepared image. See
+  [the bootloader docs](./bootloader.md) for the layout, the two copies, and EXT_CSD `PARTITION_CONFIG`.
 - **Flashing a boot hwpart leaves it selected.** u-boot's `fb_mmc_boot_ops` never restores the hwpart, so anything
   touching the user area afterwards would land in a boot partition. Every `writeBootPartition` is followed by a
   `mmc dev 0 0`.
