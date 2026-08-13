@@ -112,6 +112,29 @@ scanned for it.
 - **Sparse skips, it doesn't zero.** `--sparse` leaves whatever was already on the eMMC wherever the image is all
   zeroes. Only use it when the target range is erased or its previous contents don't matter.
 
+## In the browser
+
+The wasm bindings drive the same transport over WebUSB, with two constraints that are easy to trip over.
+
+**It needs a secure context.** `navigator.usb` is simply absent over plain HTTP, so serving the page at
+`http://192.168.x.x:5173` looks identical to "this browser has no WebUSB". `http://localhost` *is* a secure context,
+so local testing needs no TLS at all; for LAN testing, either front the dev server with a self-signed TLS proxy or
+launch Chrome with `--unsafely-treat-insecure-origin-as-secure=http://<ip>:<port>`.
+
+**The bootstrap costs two permission grants.** The mask ROM and the fastboot gadget are different USB identities, so
+the grant the user gives for `1b8e:c003` does not carry over to `18d1:fada`. The device also reports no serial
+number in the mask ROM, so Chromium can only hold that grant against the live connection and drops it the moment the
+reset disconnects it. This is why `awaitGesture` is called with a reason: the second call is a `reconnect`, and the
+page has to explain to the user why it is asking again. `WebUsb` polls `getDevices()` for a couple of seconds before
+prompting, so a device that *is* already granted reconnects without bothering anyone.
+
+A run that starts from the mask ROM therefore looks like:
+
+```text
+findingDevice -> deviceMode:usb -> connecting -> connected -> bl2Boot
+   -> resetting -> connecting -> awaitGesture(reconnect) -> connected
+```
+
 ## Throughput
 
 Measured on a Car Thing running u-boot `2026.07-rc2`, writing the same 64 MiB of incompressible data to the same
