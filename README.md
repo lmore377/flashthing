@@ -68,6 +68,9 @@ See [docs.rs](https://docs.rs/flashthing/latest/flashthing/) and the [cli](./cli
 
 Note: The documentation is very basic, sorry!
 
+`lib/tests/fastboot_hardware.rs` holds opt-in tests that run against an attached device; see the
+[fastboot docs](./docs/fastboot.md#hardware-tests).
+
 ### CLI Usage
 
 ```bash

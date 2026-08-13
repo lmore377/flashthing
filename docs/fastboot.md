@@ -111,3 +111,31 @@ scanned for it.
   `saveenv` is what persists it to `uboot.env` on the FAT `env` partition.
 - **Sparse skips, it doesn't zero.** `--sparse` leaves whatever was already on the eMMC wherever the image is all
   zeroes. Only use it when the target range is erased or its previous contents don't matter.
+
+## Hardware tests
+
+`lib/tests/fastboot_hardware.rs` drives the transport against a real device. Every write is verified by having
+u-boot `crc32` what actually landed, rather than trusting the `OKAY`.
+
+The read-only tests — the bootstrap, `getvar`, the raw-alias round trip and the download handshake — need nothing
+but an attached device:
+
+```bash
+cargo test --release --test fastboot_hardware -- --ignored --test-threads 1
+```
+
+The tests that commit to eMMC skip themselves unless they are pointed at space that can be trampled, so running
+`--ignored` on an unprepared device does nothing:
+
+```bash
+FLASHTHING_SCRATCH_LBA=2793472 \
+FLASHTHING_SCRATCH_PARTITION=bandaid \
+  cargo test --release --test fastboot_hardware -- --ignored --test-threads 1
+```
+
+- `FLASHTHING_SCRATCH_LBA` — an LBA with 20 MiB of unused space after it. Unallocated space past the last GPT
+  partition is the usual choice; `mmc part` will show you where that starts.
+- `FLASHTHING_SCRATCH_PARTITION` — a partition whose first 4 MiB can be overwritten.
+
+Both targets are read into DRAM before anything is written and put back afterwards, including when an assertion
+fails, so a scratch range that isn't empty still survives. `--test-threads 1` is required: they share one device.
