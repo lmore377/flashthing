@@ -122,10 +122,14 @@ Note that a **whole-disk image is not exempt by being recognised** — `unbrick.
 classifies as bare. What keeps it from being shifted is a size bound: a bootloader never exceeds the boot hwpart
 size, and a whole-disk image always does.
 
-The result is capped at 4 MiB, the eMMC boot hwpart size on a Car Thing. That only discards trailing padding —
-real content is around 1.3 MiB. **Caveat:** `BOOT_SIZE_MULT` is factory-set per eMMC chip and 2 MiB variants
-exist in the wild, where a 4 MiB write would be rejected with `MMC: block number 0x1001 exceeds max(0x1000)`.
-Flashthing does not currently detect this.
+**Boot hwpart writes are always 2 MiB.** `BOOT_SIZE_MULT` is factory-set per eMMC chip and Car Things exist with
+both 4 MiB and 2 MiB boot hwparts, and a 4 MiB write to a 2 MiB part is rejected outright with `MMC: block number
+0x1001 exceeds max(0x1000)`. Sizing everything for the smaller one costs nothing, because an info sector plus a
+real bootloader comes to about 1.3 MiB and the rest of a stock dump is zero padding. Content past 2 MiB is an
+error rather than a silent truncation, so a genuinely larger bootloader is refused instead of being cut in half.
+
+The user-area copy is not bounded that way — there is no hwpart limit there, and nothing until the reserved region
+at LBA 73728 — so it gets the whole image, capped only at the 4 MiB a stock dump comes in.
 
 ## Gotchas worth knowing
 

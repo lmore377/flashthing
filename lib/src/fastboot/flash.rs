@@ -505,6 +505,21 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
       }
     };
 
+    // Sized for the smaller of the two boot hwparts in the wild; the tail of a stock dump is zero padding. Real
+    // content past the bound would be silently lost, so refuse instead.
+    let image = match image.split_at_checked(crate::boot_image::BOOT_HWPART_BYTES) {
+      Some((head, tail)) => {
+        if tail.iter().any(|&byte| byte != 0) {
+          return Err(Error::InvalidOperation(format!(
+            "boot image carries content past {} bytes and will not fit a 2 MiB boot hwpart",
+            crate::boot_image::BOOT_HWPART_BYTES
+          )));
+        }
+        head
+      }
+      None => image,
+    };
+
     let mut tracker = ProgressTracker::new(image.len());
     tracker.begin_chunk();
 

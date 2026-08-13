@@ -14,8 +14,19 @@
 /// Size of the info sector, and therefore the offset the bootloader image itself sits at.
 pub const INFO_SECTOR_BYTES: usize = 512;
 
-/// How much of a bootloader image lands on disk, matching the eMMC boot hwpart size on a Car Thing.
+/// Largest a bootloader image is taken to be, and the cap on what [`to_boot_image`] returns.
+///
+/// This is the size of a stock `bootloader.dump`, so it is the right bound for "is this payload a bootloader or a
+/// whole-disk image?". It is *not* what gets written to a boot hwpart — see [`BOOT_HWPART_BYTES`].
 pub const BOOT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much of a boot image is written to an eMMC boot hwpart.
+///
+/// `BOOT_SIZE_MULT` is factory-set per eMMC chip, and Car Things exist with both 4 MiB and 2 MiB boot hwparts. A
+/// 4 MiB write to a 2 MiB part is rejected outright (`MMC: block number 0x1001 exceeds max(0x1000)`), so everything
+/// is sized for the smaller one. Nothing is lost: an info sector plus a real bootloader comes to about 1.3 MiB, and
+/// the rest of a stock dump is zero padding. Content past this bound is an error rather than a silent truncation.
+pub const BOOT_HWPART_BYTES: usize = 2 * 1024 * 1024;
 
 /// First bytes of the *stock* Car Thing BL2.
 ///
@@ -180,6 +191,16 @@ mod tests {
     sector[0x1fc] ^= 0xff;
 
     assert!(needs_info_sector(&sector));
+  }
+
+  /// A real bootloader plus its info sector fits a 2 MiB hwpart with room to spare; only padding is ever cut.
+  #[test]
+  fn a_real_bootloader_fits_the_smaller_hwpart() {
+    let bootloader = crate::BOOTLOADER_BIN;
+    assert!(bootloader.len() + INFO_SECTOR_BYTES < BOOT_HWPART_BYTES);
+
+    let image = to_boot_image(bootloader);
+    assert!(image[BOOT_HWPART_BYTES.min(image.len())..].iter().all(|&b| b == 0));
   }
 
   #[test]
