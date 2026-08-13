@@ -76,6 +76,8 @@ mod setup;
 mod web;
 
 /// Configuration types for the flashing process
+pub mod boot_image;
+
 pub mod config;
 /// The fastboot protocol and the flasher that runs flash configs over it
 pub mod fastboot;

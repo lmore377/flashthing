@@ -26,7 +26,7 @@ use crate::{
   config::{FlashConfig, FlashStep, WaitValue},
   flash::{FlashProgress, open_payload, read_payload, read_text},
   partitions::SUPERBIRD_PARTITIONS,
-  payload::{PayloadSource, PayloadStore},
+  payload::{PayloadSource, PayloadStore, inline_source},
   time::{Instant, sleep},
   usb::UsbTransport,
 };
@@ -426,6 +426,41 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
     Ok(())
   }
 
+  /// Write a prepared boot image to an eMMC boot hwpart, then put the hwpart selection back.
+  ///
+  /// The image must already be in on-disk form — see [`crate::boot_image`].
+  async fn write_boot_hwpart(&self, hwpart: u8, image: &[u8]) -> Result<()> {
+    // mmc0boot0 / mmc0boot1 are u-boot's names for the eMMC boot hwparts.
+    let target = match hwpart {
+      1 => "mmc0boot0",
+      2 => "mmc0boot1",
+      other => {
+        return Err(Error::InvalidOperation(format!(
+          "boot hwpart must be 1 or 2, got {other}"
+        )));
+      }
+    };
+
+    let mut tracker = ProgressTracker::new(image.len());
+    tracker.begin_chunk();
+
+    let progress = progress_reporter(&self.callback);
+    self
+      .fastboot
+      .download(image, |sent, _| {
+        progress(tracker.snapshot(sent as f64 * UPLOAD_SHARE));
+      })
+      .await?;
+    self.fastboot.flash(target).await?;
+
+    tracker.complete_chunk(image.len());
+    progress(tracker.snapshot(0.0));
+
+    // flashing a boot hwpart leaves it selected; anything touching the user area next would land in the wrong
+    // place entirely.
+    self.fastboot.select_hwpart(0).await
+  }
+
   async fn run_step(&mut self, step: &FlashStep) -> Result<()> {
     match step {
       FlashStep::Log { value } => {
@@ -472,36 +507,26 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
       }
 
       FlashStep::WriteBootPartition { value } => {
-        // mmc0boot0 / mmc0boot1 are u-boot's names for the eMMC boot hwparts.
-        let target = match value.hwpart {
-          1 => "mmc0boot0",
-          2 => "mmc0boot1",
-          other => {
-            return Err(Error::InvalidOperation(format!(
-              "boot hwpart must be 1 or 2, got {other}"
-            )));
-          }
-        };
-
         let data = read_payload(&value.data, &mut self.store).await?;
-        let mut tracker = ProgressTracker::new(data.len());
-        tracker.begin_chunk();
+        // A bare bootloader dump gets its info sector here; an image that already has one is written as-is.
+        let image = crate::boot_image::to_boot_image(&data);
+        self.write_boot_hwpart(value.hwpart, &image).await?;
+      }
+
+      FlashStep::RestorePartition { value } if value.name == "bootloader" => {
+        // `bootloader` is not a partition write at all. Vendor u-boot turns `amlmmc write bootloader` into an info
+        // sector plus the image, laid down in *two* places: the user-area mirror at LBA 0, which is what the SoC
+        // boots from on a Car Thing, and boot0, which backs it up. Doing only the raw user-area write here would
+        // put every byte one sector early and leave the boot hwpart empty.
+        let data = read_payload(&value.data, &mut self.store).await?;
+        let image = crate::boot_image::to_boot_image(&data);
 
         let progress = progress_reporter(&self.callback);
         self
           .fastboot
-          .download(&data, |sent, _| {
-            progress(tracker.snapshot(sent as f64 * UPLOAD_SHARE));
-          })
+          .write_raw(0, inline_source(&image).as_mut(), image.len(), false, progress)
           .await?;
-        self.fastboot.flash(target).await?;
-
-        tracker.complete_chunk(data.len());
-        progress(tracker.snapshot(0.0));
-
-        // flashing a boot hwpart leaves it selected; anything touching the user area next would land in the wrong
-        // place entirely.
-        self.fastboot.select_hwpart(0).await?;
+        self.write_boot_hwpart(1, &image).await?;
       }
 
       FlashStep::RestorePartition { value } => {
@@ -513,11 +538,8 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
         // rather than whatever GPT the device happens to be carrying right now.
         match SUPERBIRD_PARTITIONS.get(name) {
           Some(partition) => {
-            // `bootloader` is the one entry whose table size understates it: the MPT calls it 4096 sectors (2 MiB)
-            // but stock dumps of it are 4 MiB, and the amlogic path writes them whole. The space is there — the next
-            // partition does not start until LBA 73728 — so match that rather than reject a valid stock dump.
             let limit = partition.size * PART_SECTOR_SIZE;
-            if name != "bootloader" && partition.size > 0 && size > limit {
+            if partition.size > 0 && size > limit {
               return Err(Error::InvalidOperation(format!(
                 "{} image is {} bytes but the partition only holds {}",
                 name, size, limit
