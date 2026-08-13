@@ -261,31 +261,35 @@ fn writes_to_the_emmc_and_puts_it_back() {
       "the tail sector was padded with something other than zeroes"
     );
 
-    // --- sparse skips all-zero chunks rather than zeroing them ---------------
+    // --- sparse must produce the same bytes as non-sparse ---------------------
+    // The sharp case: fill the range with a known pattern, then sparse-write all zeroes over it. If sparse merely
+    // skipped zero chunks the pattern would survive; because it erases the range first, the zeroes have to land.
     let known = pattern(SCRATCH_BYTES, 0xa5a5_0003);
     write_scratch(&fastboot, lba, &known, false);
+    assert_eq!(device_crc(&fastboot, lba, SCRATCH_BYTES), crc32(&known));
 
-    // chunk 0 and chunk 2 carry data, chunk 1 is entirely zero and should be skipped
-    let mut sparse_payload = pattern(SCRATCH_BYTES, 0xa5a5_0004);
-    sparse_payload[CHUNK_BYTES..2 * CHUNK_BYTES].fill(0);
-    write_scratch(&fastboot, lba, &sparse_payload, true);
-
-    // what the eMMC should hold now: the new payload everywhere except the skipped chunk, which kept the old bytes
-    let mut expected = sparse_payload.clone();
-    expected[CHUNK_BYTES..2 * CHUNK_BYTES].copy_from_slice(&known[CHUNK_BYTES..2 * CHUNK_BYTES]);
+    let zeroes = vec![0u8; SCRATCH_BYTES];
+    write_scratch(&fastboot, lba, &zeroes, true);
     assert_eq!(
       device_crc(&fastboot, lba, SCRATCH_BYTES),
-      crc32(&expected),
-      "a sparse write did not leave the skipped chunk's previous contents in place"
+      crc32(&zeroes),
+      "a sparse write of all zeroes left the previous contents behind — it skipped without erasing"
     );
 
-    // and the same payload written without sparse must actually zero that chunk
-    write_scratch(&fastboot, lba, &sparse_payload, false);
-    assert_eq!(
-      device_crc(&fastboot, lba, SCRATCH_BYTES),
-      crc32(&sparse_payload),
-      "a non-sparse write skipped a zero chunk it should have written"
-    );
+    // and a mixed payload has to come out the same sparse or not
+    let mut mixed = pattern(SCRATCH_BYTES, 0xa5a5_0004);
+    mixed[CHUNK_BYTES..2 * CHUNK_BYTES].fill(0);
+
+    write_scratch(&fastboot, lba, &known, false);
+    write_scratch(&fastboot, lba, &mixed, true);
+    let sparse_crc = device_crc(&fastboot, lba, SCRATCH_BYTES);
+
+    write_scratch(&fastboot, lba, &known, false);
+    write_scratch(&fastboot, lba, &mixed, false);
+    let plain_crc = device_crc(&fastboot, lba, SCRATCH_BYTES);
+
+    assert_eq!(sparse_crc, crc32(&mixed), "the sparse write did not match the payload");
+    assert_eq!(sparse_crc, plain_crc, "sparse and non-sparse writes disagreed");
 
     // --- the alias must not outlive the writes -------------------------------
     let alias = pollster::block_on(fastboot.console("printenv fastboot_raw_partition_ft")).expect("printenv failed");

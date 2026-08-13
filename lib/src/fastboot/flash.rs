@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use super::client::{FASTBOOT_BUF_ADDR, Fastboot};
 use crate::{
-  Callback, Error, Event, PART_SECTOR_SIZE, Result,
+  Callback, ERASE_GROUP_SECTORS, Error, Event, PART_SECTOR_SIZE, Result,
   config::{FlashConfig, FlashStep, WaitValue},
   flash::{FlashProgress, open_payload, read_payload, read_text},
   partitions::SUPERBIRD_PARTITIONS,
@@ -123,14 +123,19 @@ impl<U: UsbTransport> Fastboot<U> {
   /// Write a stream to a raw LBA range, one download-buffer-sized chunk at a time.
   ///
   /// Each chunk points the throwaway [`RAW_ALIAS`] at its own sector range and then flashes it, so u-boot does the
-  /// actual block writes. With `sparse` set, all-zero chunks are skipped entirely — that is what makes a 64 MiB
-  /// unbrick image or a mostly-empty rootfs finish in a fraction of the time.
+  /// actual block writes.
+  ///
+  /// `sparse` means what it means on the amlogic path: the whole-erase-group span of the target range is erased up
+  /// front, and chunks that are entirely zero and land inside that span are then skipped rather than written, since
+  /// the erase already put them where the image wants them. That is what makes a 64 MiB unbrick image or a
+  /// mostly-empty rootfs finish in a fraction of the time *without* leaving stale bytes behind. If the erase fails
+  /// the skipping is abandoned and every chunk is written, so a zero in the image is never silently a no-op.
   ///
   /// # Parameters
   /// - `start_lba`: absolute LBA on the eMMC user area; sector size is 512
   /// - `source`: the payload providing the data to write
   /// - `size`: total number of bytes to read from `source`
-  /// - `sparse`: skip chunks that are entirely zero
+  /// - `sparse`: erase the range first, then skip chunks the erase already zeroed
   /// - `on_progress`: called after each upload slice and each committed chunk
   pub async fn write_raw<F: Fn(FlashProgress)>(
     &self,
@@ -152,6 +157,30 @@ impl<U: UsbTransport> Fastboot<U> {
     // next chunk's LBA off by a fraction of a sector.
     let chunk_bytes = (std::cmp::min(limit, MAX_CHUNK_BYTES) / PART_SECTOR_SIZE).max(1) * PART_SECTOR_SIZE;
 
+    // Only the whole erase groups strictly inside the range can be erased; a partial group at either end would take
+    // neighbouring data with it. Byte offsets, relative to the start of the payload.
+    let (mut erased_from, mut erased_to) = (0usize, 0usize);
+    if sparse {
+      let span_sectors = size.div_ceil(PART_SECTOR_SIZE);
+      let first = start_lba as usize;
+      let start = first.div_ceil(ERASE_GROUP_SECTORS) * ERASE_GROUP_SECTORS;
+      let end = (first + span_sectors) / ERASE_GROUP_SECTORS * ERASE_GROUP_SECTORS;
+
+      if end > start {
+        tracing::info!("erasing {} sectors at LBA {} before sparse write", end - start, start);
+        match self.erase_raw(start as u64, (end - start) as u64).await {
+          Ok(()) => {
+            erased_from = (start - first) * PART_SECTOR_SIZE;
+            erased_to = (end - first) * PART_SECTOR_SIZE;
+          }
+          // better to spend the bandwidth than to leave the caller's zeroes unwritten
+          Err(err) => tracing::warn!("erase failed ({err}); writing every chunk instead of skipping zeroes"),
+        }
+      } else {
+        tracing::info!("sparse write spans no whole erase group at LBA {first}; writing in full");
+      }
+    }
+
     let mut tracker = ProgressTracker::new(size);
     let mut buffer = vec![0u8; chunk_bytes];
     let mut lba = start_lba;
@@ -163,11 +192,13 @@ impl<U: UsbTransport> Fastboot<U> {
 
         let length = std::cmp::min(chunk_bytes, size - offset);
         source.read_exact(&mut buffer[..length]).await?;
+        let chunk_start = offset;
         offset += length;
         let sectors = length.div_ceil(PART_SECTOR_SIZE);
 
-        if sparse && buffer[..length].iter().all(|&byte| byte == 0) {
-          tracing::debug!("skipping all-zero chunk at LBA {}", lba);
+        let erased = chunk_start >= erased_from && chunk_start + length <= erased_to;
+        if erased && buffer[..length].iter().all(|&byte| byte == 0) {
+          tracing::debug!("skipping all-zero chunk at LBA {} (already erased)", lba);
           tracker.complete_chunk(length);
           on_progress(tracker.snapshot(0.0));
           lba += sectors as u64;
@@ -202,6 +233,15 @@ impl<U: UsbTransport> Fastboot<U> {
     }
 
     result
+  }
+
+  /// Erase a raw sector range through the throwaway alias.
+  ///
+  /// Kept separate from the write loop's use of the alias so a failed erase can be reported without abandoning the
+  /// write: the caller falls back to writing every chunk.
+  async fn erase_raw(&self, start_lba: u64, sectors: u64) -> Result<()> {
+    self.set_raw_target(RAW_ALIAS, start_lba, sectors).await?;
+    self.erase(RAW_ALIAS).await
   }
 
   /// Flash a partition the device resolves itself, by GPT name.
@@ -473,8 +513,11 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
         // rather than whatever GPT the device happens to be carrying right now.
         match SUPERBIRD_PARTITIONS.get(name) {
           Some(partition) => {
+            // `bootloader` is the one entry whose table size understates it: the MPT calls it 4096 sectors (2 MiB)
+            // but stock dumps of it are 4 MiB, and the amlogic path writes them whole. The space is there — the next
+            // partition does not start until LBA 73728 — so match that rather than reject a valid stock dump.
             let limit = partition.size * PART_SECTOR_SIZE;
-            if partition.size > 0 && size > limit {
+            if name != "bootloader" && partition.size > 0 && size > limit {
               return Err(Error::InvalidOperation(format!(
                 "{} image is {} bytes but the partition only holds {}",
                 name, size, limit

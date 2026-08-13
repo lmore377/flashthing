@@ -109,8 +109,12 @@ scanned for it.
 - **`writeEnv` goes through the download buffer.** The text is downloaded and parsed in place with
   `env import -t 0x6000000 <size>`, which sidesteps the 64-byte limit a `setenv` per variable would keep hitting.
   `saveenv` is what persists it to `uboot.env` on the FAT `env` partition.
-- **Sparse skips, it doesn't zero.** `--sparse` leaves whatever was already on the eMMC wherever the image is all
-  zeroes. Only use it when the target range is erased or its previous contents don't matter.
+- **Sparse erases first, then skips.** `--sparse` erases the whole-erase-group span of the target range and only
+  then skips chunks that are entirely zero, because the erase has already put them where the image wants them. The
+  result is identical to a non-sparse write; it just moves far less data. Partial erase groups at either end are
+  left alone — erasing those would take neighbouring data with them — so chunks overlapping them are written
+  normally. If the erase fails, skipping is abandoned and every chunk is written, so a zero in the image is never
+  silently a no-op.
 
 ## In the browser
 
