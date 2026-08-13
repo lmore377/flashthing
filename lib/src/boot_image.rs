@@ -1,15 +1,9 @@
 //! The on-disk form of the amlogic bootloader.
 //!
-//! A stock `bootloader.dump` is a bare bootloader image: signed BL2 first, then the FIP. That is *not* what the
-//! SoC expects to find on eMMC. Both places a bootloader lives — the eMMC boot hwparts and the user-area mirror at
-//! LBA 0 — hold a 512-byte **info sector** first, so that BL2 itself begins at LBA 1. The mask ROM reads BL2 from
-//! LBA 1, not LBA 0.
+//! On eMMC a bootloader is preceded by a 512-byte info sector, so BL2 starts at LBA 1 — where the mask ROM reads
+//! it. A stock `bootloader.dump` is bare; vendor u-boot builds the sector itself, nothing else does.
 //!
-//! Vendor u-boot builds that info sector itself, which is why `amlmmc write bootloader` can be handed a bare dump.
-//! Nothing outside vendor u-boot does, so anything writing a bootloader over fastboot (or any other raw path) has
-//! to prepend it — a bare dump written at offset 0 puts every byte one sector early and simply will not boot.
-//!
-//! See `docs/bootloader.md` for the full layout and how the two copies are used.
+//! See `docs/bootloader.md` for the layout, the two copies, and EXT_CSD `PARTITION_CONFIG`.
 
 /// Size of the info sector, and therefore the offset the bootloader image itself sits at.
 pub const INFO_SECTOR_BYTES: usize = 512;
@@ -30,12 +24,8 @@ pub const BOOT_HWPART_BYTES: usize = 2 * 1024 * 1024;
 
 /// First bytes of the *stock* Car Thing BL2.
 ///
-/// Kept as a cross-check and a landmark when reading hex dumps. It is tempting to use as an "is this a bare image?"
-/// test, since `superbird.bl2.encrypted.bin`, `superbird.bootloader.img` and a stock `bootloader.dump` all begin
-/// with it — but all three derive from the same stock BL2, and BL2 is encrypted, so this is one build's first
-/// ciphertext block rather than a magic. An 8.9.2 thinglabs `bootloader.dump` does not contain the sequence
-/// anywhere. Testing for it classifies every differently-signed bootloader as already prepared, which writes it a
-/// sector early — the one mistake on this path that reads back perfect and never boots.
+/// A landmark when reading hex dumps, and **not** usable as an "is this bare?" test: BL2 is encrypted, so this is
+/// one build's first ciphertext block, not a magic. Differently-signed bootloaders share none of it.
 pub const STOCK_BL2_PREFIX: [u8; 8] = [0x0c, 0x62, 0x7a, 0x15, 0xbe, 0x94, 0x07, 0xb2];
 
 /// Offset past the info sector's defined fields; everything from here to the checksum is reserved.
@@ -67,15 +57,11 @@ pub fn info_sector() -> [u8; INFO_SECTOR_BYTES] {
 
 /// Whether `data` already opens with an info sector.
 ///
-/// Detecting the sector is far more reliable than detecting the bootloader behind it. BL2 is encrypted, so its
-/// leading bytes differ per build and per signing key and cannot be recognised at all; an info sector is a fixed
-/// shape — a handful of small header fields, ~480 bytes of zero padding, and a checksum of everything ahead of it
-/// in the last word. High-entropy ciphertext does not accidentally take that shape.
+/// The sector is a fixed shape — small header fields, zero padding, and a checksum of everything ahead of it — so
+/// it can be recognised where the encrypted BL2 behind it cannot. An all-zero sector passes the same test.
 ///
-/// An all-zero sector passes too, since it satisfies the same test.
-///
-/// Note this does *not* protect whole-disk images: `unbrick.bin`'s own LBA 0 is high-entropy and reads as bare.
-/// What keeps those from being shifted is the size bound in the caller, not this check.
+/// This does *not* protect whole-disk images: `unbrick.bin`'s own LBA 0 is high-entropy and reads as bare. The
+/// size bound in the caller is what keeps those from being shifted.
 fn has_info_sector(data: &[u8]) -> bool {
   if data.len() < INFO_SECTOR_BYTES {
     return false;

@@ -1,22 +1,9 @@
 //! Translation layer: flash configs → fastboot.
 //!
-//! Flash archives are written against the amlogic vendor burn-mode protocol (bulkcmd, writeUserArea,
-//! restorePartition, …). A device running mainline u-boot doesn't speak any of it — it answers fastboot. Rather than
-//! require a second archive format, each step is translated into the equivalent fastboot operation here:
+//! Flash archives are written against the amlogic vendor burn-mode protocol; a device running mainline u-boot
+//! answers fastboot instead. Each step is translated here rather than requiring a second archive format.
 //!
-//! ```text
-//! writeUserArea       raw LBA write via a `fastboot_raw_partition_*` alias
-//! writeLargeMemory    the same, at the step's disk address / 512
-//! writeBootPartition  flash:mmc0boot0 / flash:mmc0boot1  (+ hwpart reset)
-//! restorePartition    the stock partition's LBA range, else a GPT name
-//! writeEnv            download + `env import -t` + `saveenv`
-//! bulkcmd             rewritten vendor command via `oem console`
-//! identify            getvar
-//! bl2Boot & friends   dropped — the bootstrap happens at connect time
-//! ```
-//!
-//! Raw writes deliberately go through `flash:` rather than `mmc write`: u-boot then does its own bounds checking and
-//! sparse-image handling, and we get one round trip per chunk instead of two.
+//! `docs/fastboot.md` has the step-by-step translation table and the reasoning behind it.
 
 use std::{future::Future, pin::Pin, time::Duration};
 
@@ -125,11 +112,8 @@ impl<U: UsbTransport> Fastboot<U> {
   /// Each chunk points the throwaway [`RAW_ALIAS`] at its own sector range and then flashes it, so u-boot does the
   /// actual block writes.
   ///
-  /// `sparse` means what it means on the amlogic path: the whole-erase-group span of the target range is erased up
-  /// front, and chunks that are entirely zero and land inside that span are then skipped rather than written, since
-  /// the erase already put them where the image wants them. That is what makes a 64 MiB unbrick image or a
-  /// mostly-empty rootfs finish in a fraction of the time *without* leaving stale bytes behind. If the erase fails
-  /// the skipping is abandoned and every chunk is written, so a zero in the image is never silently a no-op.
+  /// `sparse` erases the range first, then skips the all-zero chunks the erase has already laid down — see
+  /// `docs/fastboot.md`. If the erase fails, skipping is abandoned so a zero in the image is never a silent no-op.
   ///
   /// # Parameters
   /// - `start_lba`: absolute LBA on the eMMC user area; sector size is 512
@@ -371,14 +355,11 @@ pub struct FastbootFlasher<U: UsbTransport, S: PayloadStore> {
   force_sparse: bool,
 }
 
-/// Decide whether a user-area write is really a bootloader that needs an info sector, and return the lead to write
-/// ahead of the remaining payload.
+/// Decide whether a user-area write is really a bootloader needing an info sector, returning the lead to write
+/// ahead of the rest of the payload. Consumes the payload's first sector, which comes back inside the lead.
 ///
-/// This consumes the payload's first sector in order to classify it, so those bytes come back inside the lead.
-///
-/// Only a write landing at LBA 0 can be a bootloader, and the size bound is what keeps whole-disk images out: an
-/// `unbrick.bin` also starts at LBA 0 and also lacks an info sector, but shifting 64 MiB of disk image by a sector
-/// would destroy it. A bootloader never exceeds the boot hwpart size; a whole-disk image always does.
+/// The size bound is load-bearing: `unbrick.bin` also lands at LBA 0 without an info sector, and shifting a
+/// whole-disk image by a sector would destroy it. See `docs/bootloader.md`.
 async fn bootloader_lead(lba: u32, size: usize, source: &mut dyn PayloadSource) -> Result<Option<Vec<u8>>> {
   use crate::boot_image::{BOOT_IMAGE_BYTES, INFO_SECTOR_BYTES, info_sector, needs_info_sector};
 
@@ -608,14 +589,9 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
       }
 
       FlashStep::RestorePartition { value } if value.name == "bootloader" => {
-        // `bootloader` is not a partition write at all. Vendor u-boot turns `amlmmc write bootloader` into an info
-        // sector plus the image, laid down in the user-area mirror at LBA 0 and in the boot hwparts. Doing only the
-        // raw user-area write here would put every byte one sector early and leave the hwparts empty.
-        //
-        // The user-area mirror is what a Car Thing has been observed to boot from in practice, whatever EXT_CSD
-        // says. Both hwparts are still mirrored, because a device that still carries the stock
-        // `PARTITION_CONFIG = 0x50` points the mask ROM at *boot1*, and leaving that one empty would rest the whole
-        // restore on the mirror being reached first.
+        // Not a partition write: the image needs an info sector, and goes to the user-area mirror at LBA 0 and
+        // both boot hwparts. A raw write here would land a sector early and leave the hwparts empty.
+        // See `docs/bootloader.md`.
         let data = read_payload(&value.data, &mut self.store).await?;
         let image = crate::boot_image::to_boot_image(&data);
 

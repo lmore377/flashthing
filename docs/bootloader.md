@@ -45,11 +45,10 @@ The same info-sector-plus-image layout exists in two places:
 - **User-area LBA 0** — the mirror. On a Car Thing this is what actually boots.
 - **boot0 / boot1** (eMMC hwparts 1 and 2) — the backup, mirrored.
 
-Evidence for that ordering, measured on a device restored from a fully zeroed eMMC: it boots with **boot1 blank**
-and EXT_CSD `PARTITION_CONFIG = 0x00`, so nothing is pointing the ROM at a boot hwpart at all. Amlogic's own
-documentation frames the hwparts as primary and the user-area mirror as "BL2 fallback path 2"; on this hardware
-the observed behaviour is the other way round, and a stock Car Thing appears to boot from the user area whatever
-EXT_CSD says.
+A Car Thing boots from the user-area mirror whatever EXT_CSD says: a device restored from a fully zeroed eMMC
+comes up with **boot1 blank** and `PARTITION_CONFIG = 0x00`, nothing pointing the ROM at a hwpart at all. Amlogic's
+documentation frames the hwparts as primary and the mirror as "BL2 fallback path 2"; on this hardware it is the
+other way round.
 
 A restore should still write **both** hwparts. Stock ships `PARTITION_CONFIG = 0x50`, which points the mask ROM at
 boot1, so a device that still carries that value and an empty boot1 has nothing to fall back on if the mirror is
@@ -106,21 +105,18 @@ form:
 Both run the payload through `to_boot_image()`, which decides what to do by asking whether an info sector is
 already there — so a recipe can carry whichever file it happens to have.
 
-**It tests for the sector, not for the bootloader, and that distinction cost a flash.** The obvious test is the
-other way round: every bootloader we ship starts with `0c 62 7a 15 be 94 07 b2`, so treat that as "bare". But BL2
-is *encrypted*, and all three of those files descend from the same stock BL2 — that sequence is one build's first
-ciphertext block, not a magic. An 8.9.2 thinglabs `bootloader.dump` does not contain it anywhere in 4 MiB, so it
-read as already-prepared, went down raw, and put BL2 at LBA 0. Every byte read back correct and the device sat at
-a black screen.
+It tests for the **sector**, not for the bootloader behind it. The info sector is a fixed shape — small header
+fields, zero padding, and a checksum of everything ahead of it — which ciphertext does not take by accident. An
+all-zero sector passes the same test. Anything else is treated as bare, the safe default: a spurious 512 bytes is
+visible immediately, a bootloader one sector early is not.
 
-An info sector, by contrast, is a fixed shape: a few small header fields, ~480 bytes of zero padding, and a
-checksum of everything ahead of it in the last word. Ciphertext does not take that shape by accident. An all-zero
-sector passes too, since it satisfies the same test. Anything else is treated as bare, which is the safe default:
-a spurious 512 bytes is visible immediately, a bootloader one sector early is not.
+**Do not test for the bootloader's leading bytes instead.** Every image in this repo starts with
+`0c 62 7a 15 be 94 07 b2`, which looks like a magic and is not — BL2 is encrypted, so that is one build's first
+ciphertext block. Differently-signed bootloaders share none of it, and would be taken for already-prepared and
+written a sector early.
 
-Note that a **whole-disk image is not exempt by being recognised** — `unbrick.bin`'s own LBA 0 is high-entropy and
-classifies as bare. What keeps it from being shifted is a size bound: a bootloader never exceeds the boot hwpart
-size, and a whole-disk image always does.
+A **whole-disk image is not exempt by being recognised**: `unbrick.bin`'s own LBA 0 is high-entropy and reads as
+bare. The size bound is what keeps it from being shifted.
 
 **Boot hwpart writes are always 2 MiB.** `BOOT_SIZE_MULT` is factory-set per eMMC chip and Car Things exist with
 both 4 MiB and 2 MiB boot hwparts, and a 4 MiB write to a 2 MiB part is rejected outright with `MMC: block number

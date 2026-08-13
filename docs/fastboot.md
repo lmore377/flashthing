@@ -99,16 +99,10 @@ scanned for it.
 
 ## Things worth knowing
 
-- **`writeBootPartition` needs a payload already in boot-partition format, which a `bootloader.dump` is not.**
-  On the amlogic path there is no such step: `restorePartition bootloader` becomes `amlmmc write bootloader`, and
-  amlogic's "bootloader partition" *is* eMMC boot0. What vendor u-boot lays down there is **a 512-byte header
-  followed by the bootloader image**, so BL2 itself starts at offset `0x200`, not `0`. Copying a
-  `bootloader.dump` into boot0 raw puts everything one sector early and the boot ROM finds nothing.
-
-  That sector is amlogic's `storage_emmc_boot_info`, and the same layout is mirrored at **user-area LBA 0** —
-  which is the copy a Car Thing actually boots from. Both `restorePartition bootloader` and `writeBootPartition`
-  build it for you, from either a bare dump or an already-prepared image. See
-  [the bootloader docs](./bootloader.md) for the layout, the two copies, and EXT_CSD `PARTITION_CONFIG`.
+- **A bootloader is preceded on disk by a 512-byte info sector**, so BL2 starts at LBA 1 where the mask ROM reads
+  it. Written raw, a bare `bootloader.dump` lands a sector early and never boots. `restorePartition bootloader`,
+  `writeBootPartition` and a `writeUserArea` at LBA 0 all build it for you — see
+  [the bootloader docs](./bootloader.md).
 - **Flashing a boot hwpart leaves it selected.** u-boot's `fb_mmc_boot_ops` never restores the hwpart, so anything
   touching the user area afterwards would land in a boot partition. Every `writeBootPartition` is followed by a
   `mmc dev 0 0`.
