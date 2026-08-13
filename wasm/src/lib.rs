@@ -5,10 +5,27 @@ mod monitoring;
 
 use std::sync::Arc;
 
-use flashthing::{AmlogicSoC, Flasher, JsStore, WebUsb, config::FlashConfig, payload::PayloadStore};
+use flashthing::{
+  AmlogicSoC, Fastboot, FastbootFlasher, Flasher, JsStore, WebUsb, config::FlashConfig, payload::PayloadStore,
+};
 use wasm_bindgen::prelude::*;
 
 type WebFlasher = Flasher<WebUsb, JsStore>;
+type WebFastbootFlasher = FastbootFlasher<WebUsb, JsStore>;
+
+/// Which protocol this instance talks, decided once at construction.
+///
+/// They are not interchangeable mid-session: reaching fastboot RAM-boots a different bootloader, so a device that
+/// has been taken into vendor burn mode has to be power-cycled before it can go the other way.
+enum Backend {
+  Aml(Option<AmlogicSoC<WebUsb>>),
+  Fastboot(Option<Fastboot<WebUsb>>),
+}
+
+enum Runner {
+  Aml(WebFlasher),
+  Fastboot(WebFastbootFlasher),
+}
 
 fn to_js(error: flashthing::Error) -> JsError {
   JsError::new(&error.to_string())
@@ -29,6 +46,13 @@ export interface FlashThingOptions {
    * straight out of the event handler rather than after any further awaits.
    */
   awaitGesture: (reason: GestureReason) => Promise<void>;
+  /**
+   * Flash over fastboot against mainline u-boot instead of amlogic burn mode. A device in USB mode is RAM-booted
+   * into mainline u-boot on connect; one already in fastboot is used as-is. Defaults to false.
+   */
+  fastboot?: boolean;
+  /** Treat every raw write as sparse, skipping all-zero chunks. Fastboot only, defaults to false. */
+  forceSparse?: boolean;
   logLevelDirective?: string;
 }
 "#;
@@ -47,6 +71,12 @@ extern "C" {
   #[wasm_bindgen(method, getter, js_name = awaitGesture)]
   fn await_gesture(this: &FlashThingOptions) -> js_sys::Function;
 
+  #[wasm_bindgen(method, getter)]
+  fn fastboot(this: &FlashThingOptions) -> Option<bool>;
+
+  #[wasm_bindgen(method, getter, js_name = forceSparse)]
+  fn force_sparse(this: &FlashThingOptions) -> Option<bool>;
+
   #[wasm_bindgen(method, getter, js_name = logLevelDirective)]
   fn log_level_directive(this: &FlashThingOptions) -> Option<String>;
 }
@@ -57,8 +87,9 @@ pub struct FlashThing {
   store: JsStore,
   await_gesture: js_sys::Function,
 
-  aml: Option<AmlogicSoC<WebUsb>>,
-  flasher: Option<WebFlasher>,
+  backend: Backend,
+  force_sparse: bool,
+  flasher: Option<Runner>,
   num_steps: usize,
 }
 
@@ -75,19 +106,28 @@ impl FlashThing {
       }
     });
 
+    let backend = match options.fastboot().unwrap_or(false) {
+      true => Backend::Fastboot(None),
+      false => Backend::Aml(None),
+    };
+
     Self {
       callback,
       store: JsStore::new(options.read_all(), options.open()),
       await_gesture: options.await_gesture(),
-      aml: None,
+      backend,
+      force_sparse: options.force_sparse().unwrap_or(false),
       flasher: None,
       num_steps: 0,
     }
   }
 
-  /// Claim the device, reusing the existing claim if something already connected during this session.
-  async fn connected(&mut self) -> Result<AmlogicSoC<WebUsb>, JsError> {
-    if let Some(aml) = &self.aml {
+  /// Claim the device over the amlogic protocol, reusing the claim if one already exists in this session.
+  async fn aml(&mut self) -> Result<AmlogicSoC<WebUsb>, JsError> {
+    let Backend::Aml(slot) = &mut self.backend else {
+      return Err(JsError::new("this FlashThing was constructed for fastboot"));
+    };
+    if let Some(aml) = slot {
       return Ok(aml.clone());
     }
 
@@ -95,17 +135,54 @@ impl FlashThing {
       .await
       .map_err(to_js)?;
 
-    self.aml = Some(aml.clone());
+    *slot = Some(aml.clone());
     Ok(aml)
+  }
+
+  /// Claim the device over fastboot, bootstrapping it out of the mask ROM if needed.
+  async fn fastboot(&mut self) -> Result<Fastboot<WebUsb>, JsError> {
+    let Backend::Fastboot(slot) = &mut self.backend else {
+      return Err(JsError::new("this FlashThing was constructed for amlogic burn mode"));
+    };
+    if let Some(fastboot) = slot {
+      return Ok(fastboot.clone());
+    }
+
+    let fastboot = Fastboot::connect(self.await_gesture.clone(), Some(self.callback.clone()))
+      .await
+      .map_err(to_js)?;
+
+    *slot = Some(fastboot.clone());
+    Ok(fastboot)
   }
 
   #[wasm_bindgen(js_name = openJson)]
   pub async fn open_json(&mut self, meta: String) -> Result<(), JsError> {
     let config = FlashConfig::from_standalone(&meta).map_err(to_js)?;
-    let aml = self.connected().await?;
 
-    let flasher = Flasher::new(aml, self.store.clone(), config, Some(self.callback.clone()));
-    self.num_steps = flasher.num_steps();
+    let flasher = match self.backend {
+      Backend::Aml(_) => {
+        let aml = self.aml().await?;
+        Runner::Aml(Flasher::new(
+          aml,
+          self.store.clone(),
+          config,
+          Some(self.callback.clone()),
+        ))
+      }
+      Backend::Fastboot(_) => {
+        let fastboot = self.fastboot().await?;
+        Runner::Fastboot(
+          FastbootFlasher::new(fastboot, self.store.clone(), config, Some(self.callback.clone()))
+            .force_sparse(self.force_sparse),
+        )
+      }
+    };
+
+    self.num_steps = match &flasher {
+      Runner::Aml(flasher) => flasher.num_steps(),
+      Runner::Fastboot(flasher) => flasher.num_steps(),
+    };
     self.flasher = Some(flasher);
 
     Ok(())
@@ -117,19 +194,39 @@ impl FlashThing {
       .as_mut()
       .ok_or_else(|| JsError::new("a bundle must be opened before flashing"))?;
 
-    flasher.flash().await.map_err(to_js)
+    match flasher {
+      Runner::Aml(flasher) => flasher.flash().await.map_err(to_js),
+      Runner::Fastboot(flasher) => flasher.flash().await.map_err(to_js),
+    }
   }
 
   pub async fn unbrick(&mut self, path: String) -> Result<(), JsError> {
-    let aml = self.connected().await?;
+    // connect before opening the payload: both device handles are cheap clones, but the open borrows the store out
+    // of `self` for as long as the source lives.
+    let device = match self.backend {
+      Backend::Aml(_) => Backend::Aml(Some(self.aml().await?)),
+      Backend::Fastboot(_) => Backend::Fastboot(Some(self.fastboot().await?)),
+    };
+
     let (size, mut source) = self.store.open(&path).await.map_err(to_js)?;
 
-    aml.unbrick_from(source.as_mut(), size).await.map_err(to_js)
+    match device {
+      Backend::Aml(Some(aml)) => aml.unbrick_from(source.as_mut(), size).await.map_err(to_js),
+      Backend::Fastboot(Some(fastboot)) => fastboot.unbrick_from(source.as_mut(), size).await.map_err(to_js),
+      _ => unreachable!("the device was just connected"),
+    }
   }
 
+  /// Run a u-boot command over the amlogic burn-mode protocol.
   pub async fn bulkcmd(&mut self, command: String) -> Result<String, JsError> {
-    let aml = self.connected().await?;
+    let aml = self.aml().await?;
     aml.bulkcmd(&command).await.map_err(to_js)
+  }
+
+  /// Run a u-boot command over fastboot's `oem console` and return its console output.
+  pub async fn console(&mut self, command: String) -> Result<String, JsError> {
+    let fastboot = self.fastboot().await?;
+    fastboot.console(&command).await.map_err(to_js)
   }
 
   #[wasm_bindgen(js_name = getNumSteps)]

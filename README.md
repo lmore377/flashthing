@@ -9,6 +9,8 @@ FlashThing is a tool for quickly and easily flashing the Spotify Car Thing (Supe
 
 FlashThing currently supports flashing the Stock partition tables as well as custom partition tables using a subset of the Terbium `meta.json` standard. Read more about that standard in the [docs](./docs/meta.md).
 
+FlashThing can flash over two protocols: amlogic's vendor burn mode (the default, and what a stock device offers) or standard Android fastboot against mainline u-boot. Both take the same `meta.json` — see the [fastboot docs](./docs/fastboot.md).
+
 ## Installation
 
 ### Rust Crate
@@ -78,11 +80,22 @@ Arguments:
   [PATH]  Path to a zip file or a directory. Defaults to the current working directory if omitted
 
 Options:
-  -s, --stock    Whether the directory or archive contains a stock dump with no `meta.json` file
-      --unbrick  Whether to unbrick the device
-      --setup    setup host - this currently only sets up udev rules on Linux
-  -h, --help     Print help
-  -V, --version  Print version
+  -s, --stock          Whether the directory or archive contains a stock dump with no `meta.json` file
+      --unbrick        Whether to unbrick the device
+      --setup          setup host - this currently only sets up udev rules on Linux
+      --bulkcmd <CMD>  Send a single u-boot command to a device in USB burn mode and print its response
+  -f, --fastboot       Flash over fastboot against mainline u-boot instead of amlogic burn mode
+      --console <CMD>  Run a single u-boot command over fastboot's `oem console` and print its output
+      --sparse         Treat every raw write as sparse, skipping all-zero chunks. Only meaningful with --fastboot
+  -h, --help           Print help
+  -V, --version        Print version
+```
+
+To flash a device running mainline u-boot, add `--fastboot`. A device in USB mode (buttons 1 & 4 held at power-on) is
+RAM-booted into mainline u-boot first; one already in fastboot is used as-is.
+
+```bash
+flashthing-cli --fastboot ./firmware.zip
 ```
 
 ### Node Module Usage
@@ -94,6 +107,7 @@ const callback = (event: FlashEvent) => {
   console.log('Flash event:', event);
 };
 
+// pass `{ fastboot: true }` as a second argument to flash over fastboot instead of amlogic burn mode
 const flasher = new FlashThing(callback);
 await flasher.openArchive('path/to/archive.zip');
 
@@ -107,19 +121,24 @@ await flasher.flash();
 cd wasm && wasm-pack build --target web
 ```
 
-The browser owns device permission and archive handling, so the page supplies them as callbacks. `requestDevice`
-resolves with a connected Car Thing and is called again after a BL2 boot resets the SoC; `readAll` and `open`
-resolve payload paths out of the flash archive, with `open` returning `{ size, read(n) }` for streaming.
+The browser owns device permission and archive handling, so the page supplies them as callbacks. `awaitGesture`
+resolves once the user has clicked — the chooser only opens while that click is still live, and it is called again
+after a BL2 boot resets the SoC. `readAll` and `open` resolve payload paths out of the flash archive, with `open`
+returning `{ size, read(n) }` for streaming.
 
 ```typescript
 import init, { FlashThing } from './pkg/flashthing_wasm.js';
 
 await init();
 
-const flasher = new FlashThing(requestDevice, readAll, open, (event) => console.log(event));
-await flasher.connect(bl2, bootloader);
+const flasher = new FlashThing((event) => console.log(event), {
+  readAll,
+  open,
+  awaitGesture,
+  fastboot: true, // omit for amlogic burn mode
+});
 
-flasher.openJson(metaJson);
+await flasher.openJson(metaJson);
 console.log(`Total flashing steps: ${flasher.getNumSteps()}`);
 await flasher.flash();
 ```

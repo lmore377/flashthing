@@ -77,15 +77,18 @@ mod web;
 
 /// Configuration types for the flashing process
 pub mod config;
+/// The fastboot protocol and the flasher that runs flash configs over it
+pub mod fastboot;
 /// Payload sources the flash steps stream their data from
 pub mod payload;
-/// The USB backend the Amlogic protocol runs over
+/// The USB backend the device protocols run over
 pub mod usb;
 
 use std::sync::Arc;
 
 pub use aml::*;
 use config::FlashStep;
+pub use fastboot::{Fastboot, FastbootFlasher};
 pub use flash::{FlashProgress, Flasher};
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{FlashMode, NativeUsb, Zip};
@@ -180,6 +183,10 @@ pub enum Error {
   #[error("bulkcmd failed: {0}")]
   BulkCmdFailed(String),
 
+  /// Error when the device answers a fastboot command with FAIL, or answers with something unintelligible
+  #[error("fastboot `{command}` failed: {reason}")]
+  Fastboot { command: String, reason: String },
+
   /// Error when the meta.json version is not supported
   #[error("unsupported `meta.json` version: {0}")]
   UnsupportedVersion(usize),
@@ -218,8 +225,17 @@ pub enum Error {
 const SUPPORTED_META_VERSION_MIN: usize = 1;
 const SUPPORTED_META_VERSION_MAX: usize = 2;
 
+/// Mask-ROM-signed BL2, RAM-booted into SRAM to bring up DRAM before either bootloader is streamed in.
 pub const BL2_BIN: &[u8] = include_bytes!("../resources/superbird.bl2.encrypted.bin");
+/// Amlogic's vendor burn-mode bootloader — what BL2 is fed to reach [`AmlogicSoC`]'s bulkcmd protocol.
 pub const BOOTLOADER_BIN: &[u8] = include_bytes!("../resources/superbird.bootloader.img");
+/// Signed mainline u-boot FIP — what BL2 is fed instead to reach [`Fastboot`].
+///
+/// This is the same image terbium RAM-boots. It is a *build artifact*: it must be rebuilt with `fip-tool sign`
+/// whenever the u-boot it was cut from changes, since the bootstrap runs whatever is committed here and older FIPs
+/// predate the `oem console` and `oem maskrom` commands the fastboot flasher relies on. Callers that track their own
+/// u-boot should pass their own bytes to [`Fastboot::connect_with`] rather than use this.
+pub const FIP_BIN: &[u8] = include_bytes!("../resources/carthing.fip.bin");
 #[cfg(not(target_arch = "wasm32"))]
 const UNBRICK_BIN_ZIP: &[u8] = include_bytes!("../resources/unbrick.bin.zip");
 #[cfg(not(target_arch = "wasm32"))]
@@ -230,6 +246,11 @@ const PRODUCT_ID: u16 = 0xc003;
 
 const VENDOR_ID_NORMAL: u16 = 0x18d1;
 const PRODUCT_ID_NORMAL: u16 = 0x4e40;
+
+// our u-boot's fastboot gadget. it advertises itself as "Superbird" by "Thing Labs" via g_dnl_set_product, so this is
+// what the device shows up as in a chooser rather than a generic android entry.
+const VENDOR_ID_FASTBOOT: u16 = 0x18d1;
+const PRODUCT_ID_FASTBOOT: u16 = 0xfada;
 
 #[allow(dead_code)]
 const VENDOR_ID_BOOTED: u16 = 0x1d6b;

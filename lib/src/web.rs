@@ -9,14 +9,27 @@ use web_sys::{
 };
 
 use crate::{
-  Callback, DeviceMode, Error, Event, PRODUCT_ID, PRODUCT_ID_NORMAL, Result, VENDOR_ID, VENDOR_ID_NORMAL,
+  Callback, DeviceMode, Error, Event, PRODUCT_ID, PRODUCT_ID_FASTBOOT, PRODUCT_ID_NORMAL, Result, VENDOR_ID,
+  VENDOR_ID_FASTBOOT, VENDOR_ID_NORMAL,
   payload::{PayloadSource, PayloadStore},
   time,
-  usb::UsbTransport,
+  usb::{UsbTarget, UsbTransport},
 };
 
-const INTERFACE_NUMBER: u8 = 0;
-const SUPPORTED: [(u16, u16); 2] = [(VENDOR_ID, PRODUCT_ID), (VENDOR_ID_NORMAL, PRODUCT_ID_NORMAL)];
+/// The mask ROM exposes exactly one interface, so its number is a constant.
+const MASKROM_INTERFACE: u8 = 0;
+
+// how a fastboot interface identifies itself. matching on this rather than taking interface 0 matters because a
+// device that also exposes adb would otherwise be a coin flip.
+const FASTBOOT_CLASS: u8 = 0xff;
+const FASTBOOT_SUBCLASS: u8 = 0x42;
+const FASTBOOT_PROTOCOL: u8 = 0x03;
+
+const SUPPORTED: [(u16, u16); 3] = [
+  (VENDOR_ID, PRODUCT_ID),
+  (VENDOR_ID_FASTBOOT, PRODUCT_ID_FASTBOOT),
+  (VENDOR_ID_NORMAL, PRODUCT_ID_NORMAL),
+];
 const REACQUIRE_ATTEMPTS: usize = 8;
 const REACQUIRE_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -64,12 +77,22 @@ fn filters() -> Vec<UsbDeviceFilter> {
 }
 
 /// A device this origin has already been granted, if one is plugged in.
-async fn already_granted() -> Option<UsbDevice> {
+///
+/// `target` narrows the search to a single USB identity, which matters while re-acquiring: a device that has just
+/// been handed our FIP briefly answers to both its old grant and its new one, and picking the stale mask-ROM entry
+/// would claim a handle that is about to disappear.
+async fn already_granted(target: Option<UsbTarget>) -> Option<UsbDevice> {
   let devices = JsFuture::from(usb().ok()?.get_devices()).await.ok()?;
   Array::from(&devices)
     .iter()
     .filter_map(|value| value.dyn_into::<UsbDevice>().ok())
-    .find(supported)
+    .find(|device| match target {
+      Some(target) => {
+        let (vendor, product) = target.ids();
+        device.vendor_id() == vendor && device.product_id() == product
+      }
+      None => supported(device),
+    })
 }
 
 /// The `DOMException` name behind a rejection, which is how the chooser distinguishes a dismissal from a real fault.
@@ -130,6 +153,7 @@ fn copy_in(result: &UsbInTransferResult, buf: &mut [u8]) -> Result<usize> {
 
 struct Claimed {
   device: UsbDevice,
+  interface: u8,
   endpoint_in: u8,
   endpoint_out: u8,
 }
@@ -185,8 +209,8 @@ impl WebUsb {
   }
 
   /// Find a device, asking the page for a click only when the browser gives us no other way.
-  async fn next_device(&self, reason: GestureReason) -> Result<UsbDevice> {
-    if let Some(device) = already_granted().await {
+  async fn next_device(&self, reason: GestureReason, target: Option<UsbTarget>) -> Result<UsbDevice> {
+    if let Some(device) = already_granted(target).await {
       return Ok(device);
     }
 
@@ -195,7 +219,7 @@ impl WebUsb {
     if reason == GestureReason::Reconnect {
       for _ in 0..REACQUIRE_ATTEMPTS {
         time::sleep(REACQUIRE_INTERVAL).await;
-        if let Some(device) = already_granted().await {
+        if let Some(device) = already_granted(target).await {
           return Ok(device);
         }
       }
@@ -209,7 +233,7 @@ impl WebUsb {
       return Some(device);
     }
 
-    let device = self.next_device(GestureReason::Initial).await.ok()?;
+    let device = self.next_device(GestureReason::Initial, None).await.ok()?;
     *self.device.borrow_mut() = Some(device.clone());
     Some(device)
   }
@@ -224,30 +248,55 @@ impl WebUsb {
   }
 }
 
-fn endpoints(device: &UsbDevice) -> Result<(u8, u8)> {
+/// Pick the interface `target` speaks over, and its bulk endpoints.
+///
+/// The mask ROM only ever exposes one interface, but a fastboot gadget is identified by its class triple rather than
+/// its position, so that it can be told apart from an adb interface on the same device.
+fn interface_for(device: &UsbDevice, target: UsbTarget) -> Result<(u8, u8, u8)> {
   let configuration = device
     .configuration()
     .ok_or_else(|| Error::InvalidOperation("Interface not found".into()))?;
-  let interface = configuration
-    .interfaces()
-    .iter()
-    .find(|interface| interface.interface_number() == INTERFACE_NUMBER)
-    .ok_or_else(|| Error::InvalidOperation("Interface not found".into()))?;
 
-  let mut endpoint_in = None;
-  let mut endpoint_out = None;
-  for endpoint in interface.alternate().endpoints().iter() {
-    match endpoint.direction() {
-      UsbDirection::In => endpoint_in = Some(endpoint.endpoint_number()),
-      UsbDirection::Out => endpoint_out = Some(endpoint.endpoint_number()),
-      _ => {}
+  for interface in configuration.interfaces().iter() {
+    let Ok(interface) = interface.dyn_into::<web_sys::UsbInterface>() else {
+      continue;
+    };
+    let alternate = interface.alternate();
+
+    let matches = match target {
+      UsbTarget::Maskrom => interface.interface_number() == MASKROM_INTERFACE,
+      UsbTarget::Fastboot => {
+        alternate.interface_class() == FASTBOOT_CLASS
+          && alternate.interface_subclass() == FASTBOOT_SUBCLASS
+          && alternate.interface_protocol() == FASTBOOT_PROTOCOL
+      }
+    };
+    if !matches {
+      continue;
+    }
+
+    let mut endpoint_in = None;
+    let mut endpoint_out = None;
+    for endpoint in alternate.endpoints().iter() {
+      let Ok(endpoint) = endpoint.dyn_into::<web_sys::UsbEndpoint>() else {
+        continue;
+      };
+      match endpoint.direction() {
+        UsbDirection::In => endpoint_in = endpoint_in.or(Some(endpoint.endpoint_number())),
+        UsbDirection::Out => endpoint_out = endpoint_out.or(Some(endpoint.endpoint_number())),
+        _ => {}
+      }
+    }
+
+    if let (Some(endpoint_in), Some(endpoint_out)) = (endpoint_in, endpoint_out) {
+      return Ok((interface.interface_number(), endpoint_in, endpoint_out));
     }
   }
 
-  let endpoint_in = endpoint_in.ok_or_else(|| Error::InvalidOperation("IN endpoint not found".into()))?;
-  let endpoint_out = endpoint_out.ok_or_else(|| Error::InvalidOperation("OUT endpoint not found".into()))?;
-
-  Ok((endpoint_in, endpoint_out))
+  Err(Error::InvalidOperation(format!(
+    "no usable {:?} interface on this device",
+    target
+  )))
 }
 
 impl UsbTransport for WebUsb {
@@ -295,6 +344,11 @@ impl UsbTransport for WebUsb {
       return DeviceMode::NotFound;
     };
 
+    if device.vendor_id() == VENDOR_ID_FASTBOOT && device.product_id() == PRODUCT_ID_FASTBOOT {
+      tracing::debug!("Found device running mainline u-boot's fastboot gadget");
+      return DeviceMode::Fastboot;
+    }
+
     if device.vendor_id() == VENDOR_ID_NORMAL && device.product_id() == PRODUCT_ID_NORMAL {
       tracing::debug!("Found device booted normally, with USB Gadget (adb/usbnet) enabled");
       return DeviceMode::Normal;
@@ -314,8 +368,8 @@ impl UsbTransport for WebUsb {
     }
   }
 
-  async fn acquire(&self) -> Result<()> {
-    tracing::debug!("connecting to Amlogic device");
+  async fn acquire(&self, target: UsbTarget) -> Result<()> {
+    tracing::debug!("connecting to device as {:?}", target);
     if let Some(callback) = &self.callback {
       callback(Event::Connecting);
     };
@@ -328,27 +382,26 @@ impl UsbTransport for WebUsb {
     };
 
     if let Some(stale) = stale {
-      let _ = JsFuture::from(stale.device.release_interface(INTERFACE_NUMBER)).await;
+      let _ = JsFuture::from(stale.device.release_interface(stale.interface)).await;
       let _ = JsFuture::from(stale.device.close()).await;
     }
     self.device.borrow_mut().take();
 
-    let device = self.next_device(reason).await?;
+    let device = self.next_device(reason, Some(target)).await?;
     *self.device.borrow_mut() = Some(device.clone());
 
     if !device.opened() {
       JsFuture::from(device.open()).await.map_err(js_error)?;
     }
     JsFuture::from(device.select_configuration(1)).await.map_err(js_error)?;
-    JsFuture::from(device.claim_interface(INTERFACE_NUMBER))
-      .await
-      .map_err(js_error)?;
 
-    let (endpoint_in, endpoint_out) = endpoints(&device)?;
-    tracing::info!("device connected, claiming interface {}", INTERFACE_NUMBER);
+    let (interface, endpoint_in, endpoint_out) = interface_for(&device, target)?;
+    JsFuture::from(device.claim_interface(interface)).await.map_err(js_error)?;
+    tracing::info!("device connected, claiming interface {}", interface);
 
     *self.claimed.borrow_mut() = Some(Claimed {
       device,
+      interface,
       endpoint_in,
       endpoint_out,
     });
