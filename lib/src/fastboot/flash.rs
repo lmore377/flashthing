@@ -18,7 +18,7 @@
 //! Raw writes deliberately go through `flash:` rather than `mmc write`: u-boot then does its own bounds checking and
 //! sparse-image handling, and we get one round trip per chunk instead of two.
 
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
 
 use super::client::{FASTBOOT_BUF_ADDR, Fastboot};
 use crate::{
@@ -371,6 +371,70 @@ pub struct FastbootFlasher<U: UsbTransport, S: PayloadStore> {
   force_sparse: bool,
 }
 
+/// Decide whether a user-area write is really a bootloader that needs an info sector, and return the lead to write
+/// ahead of the remaining payload.
+///
+/// This consumes the payload's first sector in order to classify it, so those bytes come back inside the lead.
+///
+/// Only a write landing at LBA 0 can be a bootloader, and the size bound is what keeps whole-disk images out: an
+/// `unbrick.bin` also starts at LBA 0 and also lacks an info sector, but shifting 64 MiB of disk image by a sector
+/// would destroy it. A bootloader never exceeds the boot hwpart size; a whole-disk image always does.
+async fn bootloader_lead(lba: u32, size: usize, source: &mut dyn PayloadSource) -> Result<Option<Vec<u8>>> {
+  use crate::boot_image::{BOOT_IMAGE_BYTES, INFO_SECTOR_BYTES, info_sector, needs_info_sector};
+
+  if lba != 0 || size > BOOT_IMAGE_BYTES || size < INFO_SECTOR_BYTES {
+    return Ok(None);
+  }
+
+  let mut head = vec![0u8; INFO_SECTOR_BYTES];
+  source.read_exact(&mut head).await?;
+
+  if !needs_info_sector(&head) {
+    return Ok(Some(head));
+  }
+
+  tracing::info!("payload at LBA 0 is a bare bootloader; prepending an info sector so BL2 lands at LBA 1");
+  let mut lead = info_sector().to_vec();
+  lead.extend_from_slice(&head);
+  Ok(Some(lead))
+}
+
+/// A [`PayloadSource`] that yields some bytes of its own before handing over to another source.
+///
+/// Used to put bytes back that were read in order to classify a payload, and to insert an info sector ahead of a
+/// bootloader that arrived without one.
+struct PrefixedSource<'a> {
+  prefix: Vec<u8>,
+  offset: usize,
+  rest: &'a mut dyn PayloadSource,
+}
+
+impl<'a> PrefixedSource<'a> {
+  fn new(prefix: Vec<u8>, rest: &'a mut dyn PayloadSource) -> Self {
+    Self {
+      prefix,
+      offset: 0,
+      rest,
+    }
+  }
+}
+
+impl PayloadSource for PrefixedSource<'_> {
+  fn read_exact<'b>(&'b mut self, buf: &'b mut [u8]) -> Pin<Box<dyn Future<Output = Result<()>> + 'b>> {
+    Box::pin(async move {
+      let taken = (self.prefix.len() - self.offset).min(buf.len());
+      if taken > 0 {
+        buf[..taken].copy_from_slice(&self.prefix[self.offset..self.offset + taken]);
+        self.offset += taken;
+      }
+      if taken < buf.len() {
+        self.rest.read_exact(&mut buf[taken..]).await?;
+      }
+      Ok(())
+    })
+  }
+}
+
 impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
   /// Create a flasher over an already connected device and a payload store
   ///
@@ -476,9 +540,24 @@ impl<U: UsbTransport, S: PayloadStore> FastbootFlasher<U, S> {
         let sparse = value.sparse.unwrap_or(false) || self.force_sparse;
         let (size, mut source) = open_payload(&value.data, &mut self.store).await?;
         let progress = progress_reporter(&self.callback);
+
+        // Some published archives write a bare bootloader dump straight to LBA 0 as a plain user-area write rather
+        // than going through `restorePartition bootloader`. Without an info sector in front of it, BL2 lands at LBA
+        // 0 instead of LBA 1 and the device never boots, so give it one here too.
+        // The classifier consumes the payload's first sector, so it comes back inside `lead` and is already counted
+        // in `size` — only the bytes `lead` adds beyond it change the total.
+        let (lead, size) = match bootloader_lead(value.lba, size, source.as_mut()).await? {
+          Some(lead) => {
+            let total = size - crate::boot_image::INFO_SECTOR_BYTES + lead.len();
+            (lead, total)
+          }
+          None => (Vec::new(), size),
+        };
+
+        let mut source = PrefixedSource::new(lead, source.as_mut());
         self
           .fastboot
-          .write_raw(value.lba as u64, source.as_mut(), size, sparse, progress)
+          .write_raw(value.lba as u64, &mut source, size, sparse, progress)
           .await?;
       }
 
@@ -828,5 +907,65 @@ mod tests {
     assert_eq!(tracker.snapshot(0.0).percent, 50.0);
     // a pending credit larger than what is left cannot push the bar past the end
     assert_eq!(tracker.snapshot(9999.0).percent, 100.0);
+  }
+
+  /// Reading a `PrefixedSource` in odd-sized bites must not lose or duplicate the boundary.
+  #[test]
+  fn prefixed_source_splices_across_the_boundary() {
+    let rest: Vec<u8> = (0..32u8).collect();
+    let mut inner = crate::payload::BlockingSource(std::io::Cursor::new(rest.clone()));
+    let mut source = PrefixedSource::new(vec![0xaa; 8], &mut inner);
+
+    let mut out = vec![0u8; 40];
+    pollster::block_on(source.read_exact(&mut out[..3])).unwrap();
+    pollster::block_on(source.read_exact(&mut out[3..12])).unwrap();
+    pollster::block_on(source.read_exact(&mut out[12..])).unwrap();
+
+    assert_eq!(&out[..8], &[0xaa; 8]);
+    assert_eq!(&out[8..], &rest[..]);
+  }
+
+  fn lead_for(lba: u32, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut source = crate::payload::BlockingSource(std::io::Cursor::new(payload.to_vec()));
+    pollster::block_on(bootloader_lead(lba, payload.len(), &mut source)).unwrap()
+  }
+
+  /// The published 8.2.5 archive writes a bare dump straight to LBA 0; it has to gain an info sector.
+  #[test]
+  fn a_bare_bootloader_at_lba_0_gains_an_info_sector() {
+    let payload = vec![0x5a; crate::boot_image::BOOT_IMAGE_BYTES];
+    let lead = lead_for(0, &payload).expect("should be classified");
+
+    assert_eq!(lead.len(), 2 * crate::boot_image::INFO_SECTOR_BYTES);
+    assert_eq!(&lead[..crate::boot_image::INFO_SECTOR_BYTES], &crate::boot_image::info_sector());
+    // the sector consumed to classify it is handed back intact
+    assert_eq!(&lead[crate::boot_image::INFO_SECTOR_BYTES..], &payload[..crate::boot_image::INFO_SECTOR_BYTES]);
+  }
+
+  /// A whole-disk image also lands at LBA 0 and also lacks an info sector. Shifting it would destroy the image, so
+  /// the size bound has to keep it out.
+  #[test]
+  fn a_whole_disk_image_at_lba_0_is_left_alone() {
+    let payload = vec![0x5a; crate::boot_image::BOOT_IMAGE_BYTES + 1];
+    assert!(lead_for(0, &payload).is_none());
+  }
+
+  /// An image that already carries an info sector keeps its byte count unchanged.
+  #[test]
+  fn a_prepared_bootloader_at_lba_0_is_not_shifted() {
+    let mut payload = crate::boot_image::info_sector().to_vec();
+    payload.resize(crate::boot_image::BOOT_IMAGE_BYTES, 0x5a);
+
+    let lead = lead_for(0, &payload).expect("should be classified");
+    assert_eq!(lead.len(), crate::boot_image::INFO_SECTOR_BYTES);
+    assert_eq!(&lead[..], &payload[..crate::boot_image::INFO_SECTOR_BYTES]);
+  }
+
+  /// Anywhere but LBA 0 is a normal partition write and must never be touched.
+  #[test]
+  fn writes_away_from_lba_0_are_never_reshaped() {
+    let payload = vec![0x5a; 4096];
+    assert!(lead_for(1, &payload).is_none());
+    assert!(lead_for(438272, &payload).is_none());
   }
 }

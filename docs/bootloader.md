@@ -53,6 +53,12 @@ the observed behaviour is the other way round.
 Vendor u-boot writes both copies when it handles `amlmmc write bootloader`, and leaves boot1 alone. A restore
 should do the same.
 
+It writes the user-area copy **from LBA 1**, though — `GXL_START_BLK = 1` on G12A and later — so it never touches
+user-area LBA 0 at all. Measured on a restored device, that sector was still byte-identical to whatever had been
+written there previously (in our case `unbrick.bin`'s first sector), and it booted regardless. Consistent with BL2
+never reading the sector. Flashthing writes a well-formed one instead, which also boots; nothing depends on the
+contents either way.
+
 ## EXT_CSD `PARTITION_CONFIG`
 
 Byte 179 selects which boot hwpart the mask ROM reads. Stock Car Things ship `0x50` — boot ack on, boot1, user
@@ -83,6 +89,11 @@ write — it builds the on-disk image and lays down both copies:
 { "type": "restorePartition", "value": { "name": "bootloader", "data": { "filePath": "bootloader.dump" } } }
 ```
 
+Some published archives skip that step and write the bare dump straight to LBA 0 as a plain user-area write — the
+8.2.5 zip does exactly this. That is handled too: a `writeUserArea` landing at LBA 0 whose payload is at most the
+boot hwpart size gets an info sector if it lacks one. The size bound is what keeps whole-disk images out, since an
+`unbrick.bin` also starts at LBA 0 and also has no info sector, and shifting 64 MiB by a sector would ruin it.
+
 `writeBootPartition` remains the low-level escape hatch for writing one specific hwpart, and also accepts either
 form:
 
@@ -102,9 +113,12 @@ a black screen.
 
 An info sector, by contrast, is a fixed shape: a few small header fields, ~480 bytes of zero padding, and a
 checksum of everything ahead of it in the last word. Ciphertext does not take that shape by accident. An all-zero
-sector passes deliberately — that is what `unbrick.bin` carries at LBA 0, and it boots. Anything else is treated
-as bare, which is the safe default: a spurious 512 bytes is visible immediately, a bootloader one sector early is
-not.
+sector passes too, since it satisfies the same test. Anything else is treated as bare, which is the safe default:
+a spurious 512 bytes is visible immediately, a bootloader one sector early is not.
+
+Note that a **whole-disk image is not exempt by being recognised** — `unbrick.bin`'s own LBA 0 is high-entropy and
+classifies as bare. What keeps it from being shifted is a size bound: a bootloader never exceeds the boot hwpart
+size, and a whole-disk image always does.
 
 The result is capped at 4 MiB, the eMMC boot hwpart size on a Car Thing. That only discards trailing padding —
 real content is around 1.3 MiB. **Caveat:** `BOOT_SIZE_MULT` is factory-set per eMMC chip and 2 MiB variants

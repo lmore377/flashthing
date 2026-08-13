@@ -66,6 +66,7 @@ their own bytes to `Fastboot::connect_with` rather than use the bundled one.
 | Step                                                     | Fastboot equivalent                                            |
 | -------------------------------------------------------- | -------------------------------------------------------------- |
 | `writeUserArea`                                          | raw LBA write through a `fastboot_raw_partition_*` alias        |
+| `writeUserArea` at LBA 0, up to 4 MiB                    | the same, with an info sector prepended if it lacks one          |
 | `writeLargeMemory`                                       | the same, at the step's disk address ÷ 512                      |
 | `writeBootPartition`                                     | `flash:mmc0boot0` / `flash:mmc0boot1`, then a hwpart reset      |
 | `restorePartition`                                       | the stock partition's LBA range, or a GPT name if it isn't one  |

@@ -61,8 +61,10 @@ pub fn info_sector() -> [u8; INFO_SECTOR_BYTES] {
 /// shape — a handful of small header fields, ~480 bytes of zero padding, and a checksum of everything ahead of it
 /// in the last word. High-entropy ciphertext does not accidentally take that shape.
 ///
-/// An all-zero sector passes too, which is intended: that is what `unbrick.bin` and other whole-disk images carry
-/// at LBA 0, and it boots.
+/// An all-zero sector passes too, since it satisfies the same test.
+///
+/// Note this does *not* protect whole-disk images: `unbrick.bin`'s own LBA 0 is high-entropy and reads as bare.
+/// What keeps those from being shifted is the size bound in the caller, not this check.
 fn has_info_sector(data: &[u8]) -> bool {
   if data.len() < INFO_SECTOR_BYTES {
     return false;
@@ -155,8 +157,7 @@ mod tests {
     assert_eq!(to_boot_image(&prepared), prepared);
   }
 
-  /// What `unbrick.bin` and other whole-disk images carry at LBA 0. Shifting one of those by a sector would
-  /// destroy the whole image, so the all-zero sector has to read as prepared.
+  /// An all-zero sector satisfies the same shape test, so it reads as prepared.
   #[test]
   fn an_all_zero_info_sector_counts_as_prepared() {
     let mut prepared = vec![0u8; INFO_SECTOR_BYTES];
