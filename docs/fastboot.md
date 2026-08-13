@@ -112,6 +112,28 @@ scanned for it.
 - **Sparse skips, it doesn't zero.** `--sparse` leaves whatever was already on the eMMC wherever the image is all
   zeroes. Only use it when the target range is erased or its previous contents don't matter.
 
+## Throughput
+
+Measured on a Car Thing running u-boot `2026.07-rc2`, writing the same 64 MiB of incompressible data to the same
+LBA over both transports, release build, three runs each:
+
+| transport                          | throughput          |
+| ---------------------------------- | ------------------- |
+| fastboot                           | 6.95 / 6.95 / 6.92 MiB/s |
+| amlogic burn mode                  | 5.72 / 5.69 / 5.67 MiB/s |
+| fastboot, sparse, all-zero payload | 64 MiB skipped in 0.1s   |
+
+Fastboot is about 22% faster, and the reason is the round trips: burn mode stages a chunk into DRAM and then issues
+a separate `mmc write` bulkcmd, while fastboot's `flash:` commits what was just downloaded. Both use 8 MiB chunks,
+so it is otherwise like for like.
+
+The bootstrap costs the same either way — 10.2s from the mask ROM to fastboot against 10.1s to vendor burn mode —
+since both stream a bootloader of roughly the same size over the same AMLC handshake.
+
+The sparse row is not really a throughput figure; it is the all-zero skip doing nothing at all. Burn mode has the
+same trick, so it is not a fastboot win, but it is the difference between seconds and minutes on a mostly-empty
+rootfs or an unbrick image.
+
 ## Hardware tests
 
 `lib/tests/fastboot_hardware.rs` drives the transport against a real device. Every write is verified by having
